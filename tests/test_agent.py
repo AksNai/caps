@@ -212,7 +212,7 @@ class Brain:
     def __init__(self, replies):
         self.replies, self.sent = list(replies), []
 
-    def chat(self, messages, tools=None, on_text=None, stop=None):
+    def chat(self, messages, tools=None, on_text=None, stop=None, **kw):
         self.sent.append(([dict(m) for m in messages], tools))
         r = self.replies.pop(0)
         if on_text and r.get('content'):

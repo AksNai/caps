@@ -32,10 +32,11 @@ from PySide6.QtGui import QAction, QCursor  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon  # noqa: E402
 
 import agent as agent_mod  # noqa: E402
-import planner  # noqa: E402
-import schedule  # noqa: E402
+import board_api  # noqa: E402
+import sandbox  # noqa: E402
 import apps  # noqa: E402
 import commands  # noqa: E402
+import drawing  # noqa: E402
 import gestures  # noqa: E402
 import screen  # noqa: E402
 import search  # noqa: E402
@@ -44,8 +45,9 @@ from brain import Brain, BrainError  # noqa: E402
 from commands import Suggestion  # noqa: E402
 from focus import DEFAULTS as FOCUS_DEFAULTS, Focus  # noqa: E402
 from keys import TAP_MAX, CapsKeys  # noqa: E402
-from ui import (Answer, Bubble, Buddy, Carousel, GestureLayer, Ghost, Pill, Prompt, ScheduleCard, Shield,  # noqa: E402
-                TaskCard, Theme, buddy_icon, native_rect_to_logical, screen_rect_at)
+from board_ui import BoardPanel, ScreenMarks  # noqa: E402
+from ui import (Answer, Bubble, Buddy, Carousel, GestureLayer, Ghost, Pill, Prompt, Shield, TaskCard, Theme,  # noqa: E402
+                buddy_icon, native_rect_to_logical, screen_rect_at)
 
 MUTEX = r'Local\CapsMathAutocorrectKeyboardHook'  # shared with math-autocorrect/daemon.py
 DEFAULT_CONFIG = {
@@ -68,11 +70,18 @@ REPLAY_KEYS = {'enter': winutil.VK_RETURN, 'esc': winutil.VK_ESCAPE, 'back': win
                'right': winutil.VK_RIGHT}
 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP = 0x201, 0x202, 0x204, 0x205
 WM_MOUSEWHEEL, WM_MOUSEHWHEEL = 0x020A, 0x020E
-ASK_SYSTEM = """You are Caps, a small companion that lives on the user's Windows desktop. The user pointed at something and asked about their screen. You get a screenshot of the window (when available), what the mouse pointer is over, and a numbered list of the window's elements.
+ASK_SYSTEM = """You are Caps, a small companion on the user's Windows desktop that answers questions about their screen and teaches them how to do things. The user pointed at something and asked. You get a screenshot of the window (when available), what the mouse pointer is over, and a numbered list of the window's elements.
 
-Answer in one to three short sentences of plain text (no markdown; a short numbered list only if they ask for steps). Be specific to what is on screen.
-When showing them where something is would help, put one marker [[N]] right after the thing you name, using that element's number from the list, e.g. "Click Export [[12]] in the top bar." Only use a number if that element really is the thing; otherwise leave the marker out. Never mention the numbers or the list.
-If the screen doesn't show the answer, say so briefly and answer from general knowledge."""
+Answer in one to three short sentences of plain text. Be specific to what is on screen. To point at one thing, put [[N]] right after it, using that element's number from the list. Never mention the numbers or the list. If the screen doesn't show the answer, say so briefly and answer from what you know.
+
+When a drawing explains it better, add one ```board code block of Python that draws it:
+- How something works, or a graph, chart or diagram on screen: redraw it, building it up with step(caption) so each part has a one-sentence explanation. Use the labels and numbers you can see on screen.
+- Anything 3D (a shape, surface, molecule or mechanism): draw a rough 3D version.
+- How to do something in this program: teach one step at a time. mark() the element to use now, with a short note, and end your reply with [[NEXT]] if more steps follow. You will see the screen again after the user does it. When the task is complete, say so without [[NEXT]].
+Keep the code short. Plain Python, no imports needed for drawing; math is available.
+
+The drawing API:
+""" + board_api.__doc__.split('\n\n', 1)[1]
 log = logging.getLogger('caps')
 
 
@@ -207,10 +216,10 @@ class App:
         self.answer = Answer(self.theme)
         self.taskcard = TaskCard(self.theme)
         self.taskcard.choice.connect(self.on_task_choice)
-        self.schedcard = ScheduleCard(self.theme)
-        self.schedcard.choice.connect(self.on_schedule_choice)
-        self.planning, self.sched_stop, self.sched_token, self.sched_keys = False, threading.Event(), 0, False
-        self.sched_btn = False
+        self.board = BoardPanel(self.theme)
+        self.board.closed.connect(self._buddy_home)
+        self.marks = ScreenMarks(self.theme)
+        self.teach = None                     # teaching a task step by step: {'q', 'round', 'targets', 'pending'}
         self.prompt = Prompt(self.theme)
         self.prompt.query_changed.connect(self.refresh)
         self.prompt.activated.connect(self.run)
@@ -256,7 +265,6 @@ class App:
         self.answer_timer = self._timer(self.answer_tick)
         self.approve_timer = self._timer(self.approve_tick)
         self.task_timer = self._timer(self.task_tick)
-        self.sched_timer = self._timer(self.sched_tick)
         if winutil.caps_lock_on() and not self.fullscreen:
             winutil.tap(winutil.VK_CAPITAL)  # start with Caps Lock off: the key is ours now (never in a game)
             self.light_t = time.time()
@@ -398,7 +406,7 @@ class App:
                        'release': self.on_release, 'rollover': self.on_rollover, 'cancel': self.on_cancel,
                        'char': self.on_char, 'key': self.on_key, 'wheel': self.on_wheel, 'drag': self.on_drag,
                        'ask': self.on_ask, 'agent': self.on_agent, 'jot': self.on_jot, 'call': self.on_call,
-                       'apps': self.on_apps, 'sched': self.on_sched}.get(name)
+                       'apps': self.on_apps}.get(name)
             if handler:
                 handler(arg)
             if name in ('caps_down', 'tap', 'dismiss', 'release', 'cancel', 'key', 'char', 'agent'):
@@ -558,12 +566,9 @@ class App:
             self.stop_agent()          # tapping Caps Lock is the agent's stop button
             self._buddy_home()
             return
-        if self.planning:
+        if self.teach is not None:
             self.keys.stop_capture()
-            self.sched_stop.set()      # ...and the schedule planner's
-            self.planning = False
-            self.answer.fail('Stopped.')
-            self.answer_until = time.time() + 1.5
+            self.teach_next()          # while teaching, a tap means "done, show me the next step"
             return
         self.listen()
 
@@ -580,6 +585,8 @@ class App:
             self.finish(h)
 
     def on_cancel(self, _):
+        if self.teach is not None:
+            self.end_teach()           # Caps Lock + Esc stops a lesson
         if self.hold is not None:
             self.hold.cancelled = True
             self.layer.end()
@@ -733,12 +740,13 @@ class App:
             self.remember(d.hwnd, d.before)
 
     # ------------------------------------------------------------------ listening and the prompt
-    def _context(self):
-        """What you were pointing at: 'ask' looks at this window, the agent starts from it."""
+    def _context(self, foreground=False):
+        """What you were pointing at: 'ask' looks at this window, the agent starts from it.  While
+        teaching, the window you're working in instead, dialogs included."""
         px, py = winutil.cursor_pos()
-        hwnd = winutil.window_at(px, py)
         fg = winutil.foreground_hwnd()
-        if hwnd is None and fg and not winutil.foreground_is_own() and winutil.is_switchable(fg):
+        hwnd = None if foreground else winutil.window_at(px, py)
+        if hwnd is None and fg and not winutil.foreground_is_own() and (foreground or winutil.is_switchable(fg)):
             hwnd = fg
         return SimpleNamespace(pointer=(px, py), hwnd=hwnd, fg=fg)
 
@@ -756,7 +764,7 @@ class App:
 
     def stop_listening(self):
         self.listening = False
-        if self.approval is None and not self.sched_keys:
+        if self.approval is None:
             self.sync_light(self.hold is not None)
             self.keys.stop_capture()
         self.listen_timer.stop()
@@ -827,10 +835,14 @@ class App:
         """Where the companion goes when nothing is using it: next to a task or an answer, or away."""
         if self.hold is not None or self.listening:
             return
-        if self.taskcard.isVisible() or self.schedcard.isVisible():
+        if self.taskcard.isVisible():
             self.buddy.summon(True)
             if self.buddy.mode in ('follow', 'think'):
                 self.buddy.park_at(self.buddy.center())   # it stays where it is working, not at the card
+        elif self.board.isVisible():
+            self.buddy.summon(True)
+            if self.buddy.mode in ('follow', 'think'):
+                self.buddy.park_at(self.board.perch())     # it stays beside its drawing
         elif self.answer.isVisible():
             self.buddy.summon(True)
             if self.answer.target is not None:
@@ -901,10 +913,6 @@ class App:
             if choice:
                 self.decide(choice)
             return
-        if self.sched_keys and not self.listening:
-            if ch.lower() == 's':
-                self.on_schedule_choice('save')
-            return
         if self.prompt.isVisible():
             self.prompt.type_char(ch)
         elif self.listening:
@@ -918,12 +926,6 @@ class App:
         if self.approval is not None and not self.listening:
             if name in ('enter', 'esc'):
                 self.decide('allow' if name == 'enter' else 'stop')
-            return
-        if self.sched_keys and not self.listening:
-            choice = {'left': 'prev', 'up': 'prev', 'right': 'next', 'down': 'next', 'tab': 'next', 'enter': 'save',
-                      'esc': 'close'}.get(name)
-            if choice:
-                self.on_schedule_choice(choice)
             return
         if self.prompt.isVisible():
             if name == 'esc':
@@ -951,8 +953,6 @@ class App:
         if reason == 'caps':
             if self.agent_running():
                 self.stop_agent()
-            elif self.schedcard.isVisible():
-                self.close_schedule()
             elif self.answer.isVisible():
                 self.close_answer()
         self.stop_listening()
@@ -989,10 +989,7 @@ class App:
         app_items = [Suggestion(a.name, 'Open app', ('open_app', a), 'app', icon_path=a.icon)
                      for a in apps.rank(q, self.apps) if not any(apps.good_match(r, a.name) for r in running)]
         low = q.lower()
-        plans = [c for c in cmds if c.action[:1] == ('schedule',)]
-        if plans and low[:1] not in '?!>':
-            items = plans + [ask, do] + [c for c in cmds if c not in plans] + win_items
-        elif low[:1] in '?!>' or low.startswith(('ask ', 'do ')):
+        if low[:1] in '?!>' or low.startswith(('ask ', 'do ')):
             items = [ask, do] if kind == 'ask' else [do, ask]
         elif low.startswith('jot ') and cmds:
             items = cmds
@@ -1034,8 +1031,6 @@ class App:
             self.start_agent(a[1])
         elif kind == 'jot':
             self.jot(a[1])
-        elif kind == 'schedule':
-            self.plan_schedule(a[1])
         elif kind == 'focus_start':
             self.start_focus(a[1], a[2])
             self.buddy.linger(5)
@@ -1083,8 +1078,8 @@ class App:
 
     # ------------------------------------------------------------------ screenshots without our own overlays
     def _overlay_ids(self):
-        ws = (self.buddy, self.bubble, self.answer, self.taskcard, self.schedcard, self.pill, self.ghost, self.layer,
-              self.prompt,
+        ws = (self.buddy, self.bubble, self.answer, self.taskcard, self.board, self.marks, self.pill, self.ghost,
+              self.layer, self.prompt,
               self.carousel, self.shield)
         return [int(w.winId()) for w in ws if w.isVisible()]
 
@@ -1100,8 +1095,12 @@ class App:
             self.call_ui(lambda: [winutil.exclude_from_capture(h, False) for h in ids])
 
     # ------------------------------------------------------------------ ask about the screen
-    def ask(self, question):
-        ctx = self.ctx or self._context()
+    def ask(self, question, lesson=False):
+        """lesson: the next step of a lesson in progress (the screen is read again first)."""
+        ctx = self._context(foreground=True) if lesson else (self.ctx or self._context())
+        if not lesson:
+            self.end_teach(close=False)
+        self.marks.clear()
         convo = self.convo['history'] if self.convo and time.time() - self.convo['t'] < FOLLOWUP else []
         self.ask_stop.set()
         self.ask_stop = threading.Event()
@@ -1113,10 +1112,10 @@ class App:
         self.buddy.think(True, self.answer.perch())
         self.buddy.raise_()
         self.answer_timer.start(50)
-        threading.Thread(target=self._ask_worker, args=(self.ask_token, question, ctx, convo, self.ask_stop),
+        threading.Thread(target=self._ask_worker, args=(self.ask_token, question, ctx, convo, self.ask_stop, lesson),
                          daemon=True).start()
 
-    def _ask_worker(self, token, q, ctx, convo, stop):
+    def _ask_worker(self, token, q, ctx, convo, stop, lesson=False):
         def emit(*a):
             self.hub.event.emit('ask', (token,) + a)
 
@@ -1152,7 +1151,7 @@ class App:
                      + (' (a red ring marks it in the screenshot)' if ring else '')]
             if els:
                 parts.append('Elements in this window:\n' + screen.format_elements(els, frame))
-            parts.append(f'Question: {q}')
+            parts.append(f'I did that step. Show me the next one. (The task: {q})' if lesson else f'Question: {q}')
             user = {'role': 'user', 'content': '\n\n'.join(parts)}
             if images:
                 user['images'] = images
@@ -1165,12 +1164,28 @@ class App:
                     last[0] = now
                     emit('text', screen.visible_text(t))
 
-            reply = self.brain.chat([{'role': 'system', 'content': ASK_SYSTEM}] + convo + [user], on_text=on_text,
-                                    stop=stop)
+            msgs = [{'role': 'system', 'content': ASK_SYSTEM}] + convo + [user]
+            reply = self.brain.chat(msgs, on_text=on_text, stop=stop)
             if stop.is_set():
                 return
-            text, el = screen.parse_answer(reply.get('content', ''), els, frame)
-            emit('done', text or "I don't have an answer for that.", el.rect if el else None, q)
+            raw = reply.get('content', '')
+            said, code, more = screen.split_board(raw)
+            text, el = screen.parse_answer(said, els, frame)
+            board = None
+            if code:
+                emit('status', 'Drawing it')
+                r = sandbox.run(code)
+                if not r.get('ok') and not stop.is_set():   # one chance to fix its own drawing code
+                    fix = self.brain.chat(msgs + [{'role': 'assistant', 'content': raw}, {
+                        'role': 'user', 'content': f"That board code failed: {r.get('error')}. Reply with only the "
+                                                   'corrected ```board block.'}], stop=stop)
+                    code2 = screen.split_board(fix.get('content', ''))[1]
+                    r = sandbox.run(code2) if code2 else r
+                if r.get('ok') and any(st['items'] for st in (r.get('board') or {}).get('steps', [])):
+                    board = r['board']
+            rects = {e.n: e.rect for e in els}
+            emit('done', text or ("Here's a drawing." if board else "I don't have an answer for that."),
+                 el.rect if el else None, q, board, rects, more)
         except BrainError as e:
             emit('error', str(e))
         except Exception as e:
@@ -1188,18 +1203,41 @@ class App:
             if not self.listening and self.hold is None:
                 self.buddy.think(True, self.answer.perch())
         elif kind == 'done':
-            text, rect, q = rest
+            text, rect, q, board, rects, more = rest
             target = QRectF(native_rect_to_logical(*rect)) if rect else None
-            self.answer.finish(text, target)
             self.convo = {'t': time.time(), 'history': ((self.convo or {}).get('history', [])
                                                         + [{'role': 'user', 'content': q},
                                                            {'role': 'assistant', 'content': text}])[-8:]}
-            self.answer_until = time.time() + min(60.0, 8.0 + 0.06 * len(text))
+            diagram, on_screen = drawing.kinds(board) if board else (False, False)
+            marks = self.screen_marks(board, rects) if on_screen else []
+            if marks:
+                self.marks.show_marks(marks)
+                target = target or marks[0]['rect']
+            if more or (self.teach is not None and marks):
+                rnd = (self.teach or {}).get('round', 0) + 1
+                self.teach = {'q': q, 'round': rnd, 'targets': [m['rect'] for m in marks], 'pending': False,
+                              'btn': winutil.mouse_down(), 't': time.time()}
+                foot = 'Do it, or tap Caps Lock for the next step. Caps Lock + Esc stops.' if more else ''
+                if not more:
+                    self.teach = None   # the last step: nothing more to wait for
+            else:
+                foot = 'Tap Caps Lock to ask a follow-up'
+                self.teach = None
+            if diagram:
+                pt = QCursor.pos()
+                avoid = QRectF(pt.x() - 260, pt.y() - 200, 520, 400)   # what you were pointing at stays visible
+                self.show_board(dict(board, intro=text, title=board.get('title') or q[:1].upper() + q[1:]),
+                                QPointF(pt), avoid)
+                self.answer.hide()
+            else:
+                self.answer.finish(text, target, foot)
+            self.answer_until = time.time() + (600 if self.teach else min(60.0, 8.0 + 0.06 * len(text)))
             self.answer_btn = winutil.mouse_down()
             if not self.listening and self.hold is None:
                 self.buddy.think(False)
                 self._buddy_home()
             self.answer.raise_()
+            self.marks.raise_()
             self.buddy.raise_()
         elif kind == 'error':
             self.answer.fail(rest[0])
@@ -1210,13 +1248,25 @@ class App:
                 self._buddy_home()
 
     def answer_tick(self):
-        """Every 50 ms while an answer shows: it goes when you click, or after a while unread."""
+        """Every 50 ms while an answer shows: it goes when you click, or after a while unread.  In a
+        lesson, clicking the marked element is how you say you did the step."""
         if not self.answer.isVisible():
             self.answer_timer.stop()
             return
         if not self.answer.done:
             return
         now = time.time()
+        if self.teach is not None:
+            down = winutil.mouse_down()
+            pos = QPointF(QCursor.pos())
+            if self.teach['btn'] and not down and not self.teach['pending'] and \
+                    any(r.adjusted(-8, -8, 8, 8).contains(pos) for r in self.teach['targets']):
+                self.teach['pending'] = True
+                QTimer.singleShot(1200, self.teach_next)    # let the program react before looking again
+            self.teach['btn'] = down
+            if now - self.teach['t'] > 600:
+                self.end_teach()
+            return
         if self.answer.geometry().contains(QCursor.pos()):
             self.answer_until = max(self.answer_until, now + 2.0)  # you're reading it
         down = winutil.mouse_down()
@@ -1230,11 +1280,53 @@ class App:
     def close_answer(self):
         self.ask_stop.set()
         self.answer_timer.stop()
+        self.teach = None
+        self.marks.clear()
         if self.answer.isVisible():
             self.answer.hide()
         if self.buddy.mode in ('point', 'think'):
             self.buddy.follow()
         self._buddy_home()
+
+    # ------------------------------------------------------------------ drawings and lessons
+    def screen_marks(self, board, rects):
+        """Board marks on element numbers -> rectangles on the screen (logical), latest step first."""
+        out = []
+        for st in board['steps']:
+            for it in st['items']:
+                if it['t'] in ('mark', 'box') and it.get('el') in rects:
+                    out.append({'rect': QRectF(native_rect_to_logical(*rects[it['el']])),
+                                'kind': it['t'], 'num': it.get('num', ''), 'note': it.get('note', '')})
+        return out
+
+    def show_board(self, board, anchor=None, avoid=None):
+        """A drawing from an answer, or from the agent's show tool."""
+        anchor = anchor or QPointF(QCursor.pos())
+        self.board.show_board(board, anchor, avoid)
+        self.board.raise_()
+        if self.hold is None and not self.listening:
+            self.buddy.summon(True)
+            self.buddy.park_at(self.board.perch())
+            self.buddy.raise_()
+        return True
+
+    def teach_next(self):
+        """You did the step (clicked it, or tapped Caps Lock): look at the screen again, show the next."""
+        if self.teach is None:
+            return
+        if self.teach['round'] >= 15:
+            self.end_teach()
+            return
+        self.marks.clear()
+        self.ask(self.teach['q'], lesson=True)
+
+    def end_teach(self, close=True):
+        if self.teach is None:
+            return
+        self.teach = None
+        self.marks.clear()
+        if close:
+            self.close_answer()
 
     # ------------------------------------------------------------------ agent mode
     def start_agent(self, goal):
@@ -1253,7 +1345,7 @@ class App:
         ui = TaskBridge(self, self.agent_token, stop)
         hands = agent_mod.Hands(self.apps, os.getpid(), ui_call=self.call_ui, point=ui.point,
                                 grab_hidden=self.grab_hidden, jot=self.jot_for_agent,
-                                focus=lambda m, label: self.start_focus(m, label))
+                                focus=lambda m, label: self.start_focus(m, label), show=self.show_board)
 
         def go():
             try:
@@ -1397,141 +1489,6 @@ class App:
         self.taskcard.hide()
         if self.buddy.mode in ('park', 'point'):
             self.buddy.follow()
-        self._buddy_home()
-
-    # ------------------------------------------------------------------ class schedules
-    def plan_schedule(self, request):
-        """'build my schedule, no classes before 10': read the plan and the sections on screen,
-        then show every schedule that fits (planner.py, schedule.py)."""
-        if self.planning:
-            return
-        self.close_schedule()
-        ctx = self.ctx or self._context()
-        self.sched_stop.set()
-        self.sched_stop = threading.Event()
-        self.sched_token += 1
-        self.planning = True
-        anchor = self.buddy.center() if self.buddy.isVisible() else QPointF(QCursor.pos()) + Buddy.OFFSET
-        self.answer.start(request, anchor, 'Looking at your screen')
-        self.buddy.summon(True)
-        self.buddy.think(True, self.answer.perch())
-        self.answer_timer.start(50)
-        token, stop = self.sched_token, self.sched_stop
-
-        def emit(*a):
-            self.hub.event.emit('sched', (token,) + a)
-
-        def go():
-            try:
-                if not self.brain.capabilities():
-                    emit('error', f"Can't reach Ollama at {self.brain.url}. Is it running?")
-                    return
-                if not self.brain.loaded():
-                    emit('status', 'Waking up the model (about 30 s the first time)')
-                res = planner.plan_schedule(self.brain, request, os.getpid(), ctx.pointer,
-                                            progress=lambda s: emit('status', s), stop=stop)
-                if not stop.is_set():
-                    emit('done', res)
-            except BrainError as e:
-                emit('error', str(e))
-            except Exception as e:
-                log.exception('schedule planning failed')
-                emit('error', f'Something went wrong: {e}')
-
-        threading.Thread(target=go, daemon=True).start()
-
-    def on_sched(self, arg):
-        token, kind, *rest = arg
-        if token != self.sched_token:
-            return
-        if kind == 'status':
-            if self.answer.isVisible():
-                self.answer.set_status(rest[0])
-            return
-        self.planning = False
-        if kind == 'error' or (kind == 'done' and not rest[0].options and not rest[0].items):
-            msg = rest[0] if kind == 'error' else rest[0].error
-            self.answer.fail(msg)
-            self.answer_until = time.time() + 12
-            self.answer_btn = winutil.mouse_down()
-            self.buddy.think(False)
-            self._buddy_home()
-            return
-        res = rest[0]
-        self.answer.hide()
-        self.answer_timer.stop()
-        self.buddy.think(False)
-        self.schedcard.show_result(res, screen_rect_at(QCursor.pos()))
-        self.schedcard.raise_()
-        self.buddy.summon(True)
-        self.buddy.park_at(self.buddy.center())
-        self.buddy.raise_()
-        self.sched_keys = True
-        self.keys.start_capture(time.monotonic())   # ← → Enter Esc go to the card; nothing takes focus
-        self.sched_btn = winutil.mouse_down()
-        self.sched_timer.start(15)
-        self.sync_light()
-
-    def sched_tick(self):
-        """While the schedule card has the keys: keep the capture alive; a click elsewhere gives them back."""
-        if not self.sched_keys or not self.schedcard.isVisible():
-            self.sched_timer.stop()
-            return
-        self.keys.ack(time.monotonic())
-        if not self.keys.capturing:
-            self.sched_keys = False   # a shortcut went through; the card's buttons still work
-            self.sched_timer.stop()
-            self.sync_light()
-            return
-        down = winutil.mouse_down()
-        if down and not self.sched_btn and not self.schedcard.geometry().contains(QCursor.pos()):
-            self.sched_keys = False
-            self.sync_light(False)
-            self.keys.stop_capture()
-            self.sched_timer.stop()
-        self.sched_btn = down
-
-    def on_schedule_choice(self, choice):
-        card = self.schedcard
-        if choice == 'prev':
-            card.step(-1)
-        elif choice == 'next':
-            card.step(1)
-        elif choice == 'save':
-            self.save_schedule()
-        elif choice == 'close':
-            self.close_schedule()
-
-    def save_schedule(self):
-        """Copy the section list (to register with) and, when the section dates are known, write a
-        calendar file to Downloads that Outlook or Google Calendar can import."""
-        card, res = self.schedcard, self.schedcard.result
-        cur = card.current
-        if cur is None:
-            return
-        text = schedule.summary(cur, res.term)
-        QApplication.clipboard().setText(text)
-        saved = 'Copied the section list'
-        start, end = res.term_dates
-        if start and end:
-            folder = os.path.join(os.path.expanduser('~'), 'Downloads')
-            name = f"{(res.term or 'Class').replace(' - Projected', '')} schedule.ics".replace('/', '-')
-            path = os.path.join(folder if os.path.isdir(folder) else DATA, name)
-            with open(path, 'w', encoding='utf-8', newline='') as f:
-                f.write(schedule.to_ics(cur, start, end, res.term))
-            saved += f' and saved {name} to Downloads (open it to add to your calendar)'
-        card.saved = saved + '.'
-        card.update()
-
-    def close_schedule(self):
-        if self.schedcard.isVisible():
-            self.schedcard.hide()
-        if self.sched_keys:
-            self.sched_keys = False
-            self.sched_timer.stop()
-            if not self.listening and self.approval is None:
-                self.sync_light(False)
-                self.keys.stop_capture()
         self._buddy_home()
 
     # ------------------------------------------------------------------ jot

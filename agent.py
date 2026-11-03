@@ -21,10 +21,12 @@ import threading
 import time
 
 import apps as apps_mod
+import board_api
+import sandbox
 import screen
 import winutil
 
-MAX_STEPS = 20
+MAX_STEPS = 30
 OBSERVE_ELEMENTS = 140
 
 SYSTEM = """You are Caps, an assistant that operates the user's Windows PC for them, using tools one call at a time.
@@ -32,7 +34,10 @@ SYSTEM = """You are Caps, an assistant that operates the user's Windows PC for t
 How to work:
 - You get the open windows (w1, w2, ...) and the elements of the active window (numbered). Use those numbers exactly as listed. After each action you get a fresh listing and older numbers stop being valid.
 - Use the most direct tool: open_app to start or bring up an app; open_url for any website or web search, with the full address (e.g. https://www.youtube.com/results?search_query=lofi+beats or https://www.google.com/search?q=...), never by typing into a browser; arrange for window layout; find_files then open_path for documents; make_folder for new folders; start_focus and jot for focus sessions and notes; run_command only when nothing else fits.
-- To type into a field, click it first (or use a shortcut such as ctrl+l for a browser's address bar), then type_text.
+- To type into a field, pass its element number to type_text (or click it first, or use a shortcut such as ctrl+l for a browser's address bar).
+- The element list only has what is visible. Use find to locate something that is scrolled out of view or not listed (its number then works with click and type_text), read_page to read a whole web page or document including the parts not on screen, and scroll to move through it.
+- Use compute for anything you'd work out on paper: arithmetic, dates, statistics, or trying every combination (for example picking one class section per course with no time conflicts). It runs Python; print the result.
+- Use show to explain or present something visually: a chart, a diagram, a timetable, a 3D shape.
 - If something doesn't work, try one other way. If you are stuck, call done and say what is blocking you.
 - Never type passwords or payment details and never buy anything. Don't send messages, emails or posts unless the task explicitly asks for that exact message.
 - Some actions wait for the user's OK. If the user declines, stop; don't try to get around it.
@@ -41,6 +46,7 @@ How to work:
 PLAN_ASK = ('\n\nYour tools: {tools}.\n\nFirst reply with your plan only: at most 5 short numbered steps, one line '
             'each, using those tools. No tool calls yet.')
 GO = 'Go ahead: carry out the plan, one tool call at a time, and call done when finished.'
+SYSTEM += '\n\nThe drawing API for show:\n' + board_api.__doc__.split('\n\n', 1)[1]
 
 
 def _fn(tool, desc, required=(), /, **props):
@@ -67,8 +73,8 @@ TOOLS = [
         window=I),
     _fn('click', 'Click an element from the latest listing.', ['element'], element=I,
         button={'type': 'string', 'enum': ['left', 'right']}),
-    _fn('type_text', 'Type text into the focused field of a window, optionally pressing Enter after it.', ['text'],
-        text=S, window=I, enter=B),
+    _fn('type_text', 'Type text into a field (an element number from the listing or from find), or into whatever '
+        'has focus, optionally pressing Enter after it.', ['text'], text=S, element=I, window=I, enter=B),
     _fn('press_keys', 'Press a key or shortcut in a window, e.g. "ctrl+t", "enter", "alt+left", "playpause".',
         ['keys'], keys=S, window=I),
     _fn('run_command', 'Run a PowerShell command on the PC and get its output.', ['command'], command=S),
@@ -76,12 +82,23 @@ TOOLS = [
     _fn('start_focus', 'Start a focus session that blocks distracting apps and sites.', ['minutes'], minutes=I,
         label=S),
     _fn('wait', 'Wait for something to load (at most 10 seconds).', ['seconds'], seconds={'type': 'number'}),
+    _fn('find', 'Find elements of a window whose name or value contains this text, including ones scrolled out of '
+        'view. Returns them with numbers you can click or type into.', ['text'], text=S, window=I),
+    _fn('read_page', 'Read all the text of the web page(s) or document in a window, including parts not on screen.',
+        [], window=I),
+    _fn('scroll', 'Scroll a window up or down.', ['direction'], direction={'type': 'string', 'enum': ['up', 'down']},
+        amount={**I, 'description': 'notches, default 5'}, window=I),
+    _fn('compute', 'Run Python to calculate something (math, itertools, numpy, sympy, datetime...; no files or '
+        'network). Print what you need; the output comes back to you.', ['code'], code=S),
+    _fn('show', 'Draw something for the user in a panel: a chart, diagram, timetable or 3D shape, with the board '
+        'API (axes, plot, line, arrow, point, text, rect, polygon, step(caption), surface, sphere, box, line3d...).',
+        ['code'], code=S),
     _fn('done', 'Finish and tell the user what happened, or what you need from them.', ['message'], message=S),
 ]
 TOOL_NAMES = {t['function']['name'] for t in TOOLS}
-REPEATABLE = {'wait', 'read_screen', 'press_keys', 'click'}   # fine to do several times in one task
+REPEATABLE = {'wait', 'read_screen', 'press_keys', 'click', 'scroll', 'find', 'read_page'}   # fine to repeat
 CHANGES_SCREEN = {'open_app', 'open_url', 'open_path', 'switch_to', 'arrange', 'close_window', 'click', 'type_text',
-                  'press_keys'}
+                  'press_keys', 'scroll'}
 
 # ------------------------------------------------------------------ what needs your OK (decided here, not by the model)
 SAFE_KEYS = {'tab', 'shift+tab', 'up', 'down', 'left', 'right', 'pageup', 'pagedown', 'home', 'end', 'esc', 'escape',
@@ -230,6 +247,16 @@ def describe(name, a, names=None):
         return f"Open {a.get('url', '?')}"
     if name == 'open_path':
         return f"Open {a.get('path', '?')}"
+    if name == 'find':
+        return f"Look for {_q(a.get('text', ''))}"
+    if name == 'read_page':
+        return f"Read {win(a['window']) if a.get('window') else 'the page'}"
+    if name == 'scroll':
+        return f"Scroll {a.get('direction', 'down')}"
+    if name == 'compute':
+        return 'Work something out'
+    if name == 'show':
+        return 'Draw it for you'
     if name == 'make_folder':
         return f"Create the folder {a.get('path', '?')}"
     if name == 'find_files':
@@ -248,7 +275,7 @@ def describe(name, a, names=None):
     if name == 'click':
         return f"{'Right-click' if a.get('button') == 'right' else 'Click'} {el(a.get('element'))}"
     if name == 'type_text':
-        where = f" into {win(a['window'])}" if a.get('window') else ''
+        where = f" into {el(a['element'])}" if a.get('element') else f" into {win(a['window'])}" if a.get('window') else ''
         return f"Type {_q(a.get('text', ''))}{where}" + (', then press Enter' if a.get('enter') else '')
     if name == 'press_keys':
         return f"Press {norm_keys(a.get('keys', '?'))}" + (f" in {win(a['window'])}" if a.get('window') else '')
@@ -323,7 +350,10 @@ class Agent:
         if images:
             first['images'] = images
         msgs = [{'role': 'system', 'content': SYSTEM}, first]
-        reply = self.brain.chat(msgs, tools=None, on_text=self.ui.plan, stop=self.stop)
+        # a task with several parts gets some thinking time before the plan; a simple one doesn't wait for it
+        think = len(goal.split()) >= 12 or bool(re.search(r'\b(plan|schedule|figure|compare|best|optimi[sz]e|'
+                                                          r'organi[sz]e|every|all of)\b', goal, re.I))
+        reply = self.brain.chat(msgs, tools=None, on_text=self.ui.plan, stop=self.stop, think=think)
         if self._stopped():
             return
         plan = reply.get('content', '').strip()
@@ -427,14 +457,14 @@ class Hands:
     """Carries out tool calls.  Lives on the agent's thread (UI Automation objects are per-thread);
     anything that must touch the UI goes through ui_call."""
 
-    def __init__(self, app_list, own_pid, ui_call=None, point=None, grab_hidden=None, jot=None, focus=None,
+    def __init__(self, app_list, own_pid, ui_call=None, point=None, grab_hidden=None, jot=None, focus=None, show=None,
                  vision=True):
         self.apps = app_list
         self.own_pid = own_pid
         self.ui_call = ui_call or (lambda fn: fn())
         self.point = point or (lambda rect: None)
         self.grab_hidden = grab_hidden or screen.grab
-        self.jot_fn, self.focus_fn = jot, focus
+        self.jot_fn, self.focus_fn, self.show_fn = jot, focus, show
         self.vision = vision
         self.windows, self.elements, self.el_window = {}, {}, None
         self._seer = None
@@ -526,7 +556,7 @@ class Hands:
             n, w = active
             frame = winutil.frame_rect(w.hwnd)
             try:
-                els = screen.select(self.seer.elements(w.hwnd), frame, None, OBSERVE_ELEMENTS)
+                els = screen.select(self.seer.elements(w.hwnd, refs=True), frame, None, OBSERVE_ELEMENTS)
             except Exception:
                 els = []
             self.elements, self.el_window = {e.n: e for e in els}, w.hwnd
@@ -668,12 +698,31 @@ class Hands:
             self._front(hwnd)
         return True, 'Here is the screen now.'
 
+    def _bring_into_view(self, e):
+        """An element scrolled out of view (or found with find): focusing it through UI Automation
+        scrolls it onto the screen.  Returns its rect now."""
+        if e.ref is None:
+            return e.rect
+        fl, ft, fr, fb = winutil.frame_rect(self.el_window)
+        cx, cy = e.center
+        if fl <= cx < fr and ft <= cy < fb:
+            return e.rect
+        try:
+            e.ref.SetFocus()
+            time.sleep(0.4)
+            r = e.ref.CurrentBoundingRectangle
+            e.rect = (r.left, r.top, r.right, r.bottom)
+        except Exception:
+            pass
+        return e.rect
+
     def t_click(self, element=None, button='left'):
         e = self.elements.get(_int(element))
         if e is None or not winutil.exists(self.el_window):
             return False, f'There is no element {element} in the latest listing.'
         if winutil.foreground_hwnd() != self.el_window:
             self._front(self.el_window)
+        self._bring_into_view(e)
         self.point(e.rect)
         time.sleep(0.45)   # let the companion get there first, so you see what is being clicked
         x, y = e.center
@@ -681,8 +730,22 @@ class Hands:
         time.sleep(0.7)
         return True, f'Clicked {e.role} "{e.name[:60]}".'
 
-    def t_type_text(self, text='', window=None, enter=False):
-        if window:
+    def t_type_text(self, text='', element=None, window=None, enter=False):
+        if element:
+            e = self.elements.get(_int(element))
+            if e is None or not winutil.exists(self.el_window):
+                return False, f'There is no element {element} in the latest listing.'
+            if winutil.foreground_hwnd() != self.el_window:
+                self._front(self.el_window)
+            self._bring_into_view(e)
+            try:
+                e.ref.SetFocus()          # a web form field: focus it the way a click would
+            except Exception:
+                x, y = e.center
+                winutil.click_at(x, y)
+            time.sleep(0.25)
+            winutil.chord(winutil.VK_CONTROL, ord('A'))   # replace what's in the field
+        elif window:
             self._front(self._win(window).hwnd)
         fg = winutil.foreground()
         self._show_focus(fg.hwnd if fg else None)
@@ -734,6 +797,76 @@ class Hands:
             s = 2.0
         time.sleep(s)
         return True, f'Waited {s:g} s.'
+
+    def _target_window(self, window=None):
+        if window:
+            return self._win(window).hwnd
+        return self.el_window or winutil.foreground_hwnd()
+
+    def t_find(self, text='', window=None):
+        hwnd = self._target_window(window)
+        needle = str(text).lower().strip()
+        if not needle:
+            return False, 'Say what text to look for.'
+        rows = [r for r in self.seer.elements(hwnd, refs=True, offscreen=True)
+                if needle in (r[1] or '').lower() or needle in (r[3] or '').lower()]
+        if not rows:
+            return True, f'Nothing in that window mentions "{text}".'
+        start = max(self.elements, default=0) + 1
+        out = []
+        for k, (role, name, rect, value, ref) in enumerate(rows[:15]):
+            n = start + k
+            self.elements[n] = screen.Element(n, role, ' '.join(name.split())[:100], rect, (value or '')[:80], ref)
+            out.append(f'{n}. {role} "{self.elements[n].name}"' + (f' = "{value[:60]}"' if value and value != name else ''))
+        self.el_window = hwnd
+        more = f'\n({len(rows) - 15} more not shown)' if len(rows) > 15 else ''
+        return True, 'Found:\n' + '\n'.join(out) + more
+
+    def t_read_page(self, window=None):
+        hwnd = self._target_window(window)
+        parts = []
+        try:
+            pages = self.seer.pages(hwnd)
+        except Exception:
+            pages = []
+        for title, url, rect, el in pages:
+            parts.append(f'=== {title or url}\n' + self.seer.text(el, 12000))
+        if not parts:
+            parts.append(self.seer.text(self.seer.uia.ElementFromHandle(hwnd), 12000))
+        text = '\n\n'.join(parts)
+        return True, text[:20000] + ('\n(cut off)' if len(text) > 20000 else '')
+
+    def t_scroll(self, direction='down', amount=5, window=None):
+        hwnd = self._target_window(window)
+        l, t, r, b = winutil.frame_rect(hwnd)
+        back = winutil.cursor_pos()
+        winutil.user32.SetCursorPos((l + r) // 2, (t + b) // 2)
+        notch = -120 if str(direction).lower() == 'down' else 120
+        for _ in range(max(1, min(int(_int(amount) or 5), 30))):
+            winutil.send([winutil.INPUT(0, winutil._U(mi=winutil.MOUSEINPUT(0, 0, notch & 0xFFFFFFFF, 0x0800, 0,
+                                                                              winutil.MAGIC)))])
+            time.sleep(0.03)
+        winutil.user32.SetCursorPos(*back)
+        time.sleep(0.6)
+        return True, f'Scrolled {direction}.'
+
+    def t_compute(self, code=''):
+        r = sandbox.run(str(code))
+        if not r.get('ok'):
+            return False, f"Error: {r.get('error')}\n{r.get('stdout', '')}".strip()
+        return True, (r.get('stdout') or '(nothing printed; print the result)').strip()[:6000]
+
+    def t_show(self, code=''):
+        r = sandbox.run(str(code))
+        if not r.get('ok'):
+            return False, f"Error: {r.get('error')}"
+        board = r.get('board') or {}
+        if not any(s['items'] for s in board.get('steps', [])):
+            return False, 'Nothing was drawn; use the board functions (plot, rect, text, surface...).'
+        if not self.show_fn:
+            return False, 'Drawing is not available.'
+        self.ui_call(lambda: self.show_fn(board))
+        return True, 'It is on the screen now.'
 
 
 def _int(v):

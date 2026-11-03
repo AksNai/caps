@@ -7,7 +7,7 @@ companion points at the element's real on-screen rectangle."""
 import base64
 import io
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 ROLES = {50000: 'button', 50002: 'checkbox', 50003: 'combobox', 50004: 'edit', 50005: 'link', 50006: 'image',
          50007: 'list item', 50011: 'menu item', 50013: 'radio', 50015: 'slider', 50019: 'tab', 50020: 'text',
@@ -25,6 +25,7 @@ class Element:
     name: str
     rect: tuple          # physical pixels (l, t, r, b)
     value: str = ''
+    ref: object = field(default=None, repr=False, compare=False)   # the UI Automation element, same thread only
 
     @property
     def center(self):
@@ -41,7 +42,9 @@ def select(raw, frame, pointer=None, limit=200):
     window, drops duplicates, keeps the `limit` nearest the pointer, numbers them in reading order."""
     fl, ft, fr, fb = frame
     seen, keep = set(), []
-    for role, name, rect, value in raw:
+    for row in raw:
+        role, name, rect, value = row[:4]
+        ref = row[4] if len(row) > 4 else None
         name = ' '.join((name or '').split())[:100]
         value = ' '.join((value or '').split())[:80]
         if role not in LISTED or not (name or value):
@@ -56,13 +59,13 @@ def select(raw, frame, pointer=None, limit=200):
         if key in seen:
             continue
         seen.add(key)
-        keep.append((role, name, rect, value))
+        keep.append((role, name, rect, value, ref))
     if len(keep) > limit:
         px, py = pointer if pointer else ((fl + fr) / 2, (ft + fb) / 2)
         keep.sort(key=lambda e: ((e[2][0] + e[2][2]) / 2 - px) ** 2 + ((e[2][1] + e[2][3]) / 2 - py) ** 2)
         keep = keep[:limit]
     keep.sort(key=lambda e: (e[2][1] // 24, e[2][0]))
-    return [Element(i + 1, role, name, rect, value) for i, (role, name, rect, value) in enumerate(keep)]
+    return [Element(i + 1, role, name, rect, value, ref) for i, (role, name, rect, value, ref) in enumerate(keep)]
 
 
 def where(rect, frame):
@@ -124,7 +127,9 @@ def parse_answer(text, els, frame=None):
 
 def visible_text(partial):
     """Streaming: hide markers, including one that is only half written."""
-    t = COORD.sub('', partial)
+    t = partial.split('```')[0]           # a drawing's code is never shown as text
+    t = NEXT.sub(' ', t)
+    t = COORD.sub('', t)
     t = re.sub(r'\s?\[\[?[^\]]*\]?$', '', t)
     return re.sub(r' +([.,;:!?)])', r'\1', t).strip()
 
@@ -150,11 +155,13 @@ class Seer:
             self.cache.AddProperty(pid)
         self.visible = self.uia.CreatePropertyCondition(30022, False)  # IsOffscreen == False
 
-    def elements(self, hwnd):
-        """[(role, name, rect, value)] for every on-screen element of a window."""
+    def elements(self, hwnd, refs=False, offscreen=False):
+        """[(role, name, rect, value[, ref])] for every on-screen element of a window (with
+        offscreen=True, also the ones scrolled out of view)."""
         out = []
         root = self.uia.ElementFromHandle(hwnd)
-        arr = root.FindAllBuildCache(4, self.visible, self.cache)  # TreeScope_Descendants
+        cond = self.uia.CreateTrueCondition() if offscreen else self.visible
+        arr = root.FindAllBuildCache(4, cond, self.cache)  # TreeScope_Descendants
         for i in range(arr.Length):
             e = arr.GetElement(i)
             role = ROLES.get(e.CachedControlType)
@@ -165,8 +172,8 @@ class Seer:
                 value = e.GetCachedPropertyValue(30045) or ''
             except Exception:
                 value = ''
-            out.append((role, e.CachedName or '', (r.left, r.top, r.right, r.bottom),
-                        value if isinstance(value, str) else ''))
+            row = (role, e.CachedName or '', (r.left, r.top, r.right, r.bottom), value if isinstance(value, str) else '')
+            out.append(row + (e,) if refs else row)
         return out
 
     def focused_rect(self):
@@ -313,3 +320,20 @@ def encode(img, pointer=None, max_side=1536, quality=86):
     buf = io.BytesIO()
     img.save(buf, 'JPEG', quality=quality)
     return base64.b64encode(buf.getvalue()).decode()
+
+
+# ------------------------------------------------------------------ drawings and lessons in answers
+BOARD_BLOCK = re.compile(r'```(?:board|python|py)?[ \t]*\r?\n(.*?)```', re.S)
+NEXT = re.compile(r'\s*\[\[\s*NEXT\s*\]\]\s*', re.I)
+
+
+def split_board(text):
+    """The model's answer -> (what to say, drawing code or '', whether more lesson steps follow)."""
+    m = BOARD_BLOCK.search(text)
+    code = m.group(1).strip() if m else ''
+    rest = BOARD_BLOCK.sub(' ', text) if m else text
+    if '```' in rest:                      # a block that was cut off: drop it, don't show code as text
+        rest = rest[:rest.index('```')]
+    more = bool(NEXT.search(rest))
+    rest = NEXT.sub(' ', rest)
+    return re.sub(r'[ \t]+\n', '\n', re.sub(r'  +', ' ', rest)).strip(), code, more

@@ -85,11 +85,6 @@ def suggest(query, state):
             out.append(Suggestion(f'Allow distractions for {fmt_min(m)}', 'Focus timer keeps running',
                                   ('allow', m), 'focus'))
 
-    # ---- class schedule (from the plan and the registration site on screen)
-    if re.search(r'\bschedul', q) or q in ('plan classes', 'plan my classes', 'classes'):
-        out.append(Suggestion('Plan a class schedule', 'From your course plan and the sections on screen (Workday...)',
-                              ('schedule', query.strip()), 'schedule'))
-
     # ---- jot
     if q.startswith('jot ') and q[4:].strip():
         text = query.strip()[4:].strip()
