@@ -1,0 +1,7 @@
+PySide6-Essentials>=6.6
+pynput>=1.7
+requests>=2.28
+comtypes>=1.2          # UI Automation (ask about the screen, agent mode)
+Pillow>=10             # screenshots
+# optional, for math autocorrect inside Caps: see ../math-autocorrect/requirements.txt
+# for ask and agent mode: Ollama (https://ollama.com) with a vision + tools model, e.g. qwen3.8:27b
