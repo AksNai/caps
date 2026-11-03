@@ -1,7 +1,7 @@
 # Caps
 
 I built this to make my computer easier to use. 
-Tap Caps Lock and type, or hold it and move the mouse.
+Tap Caps Lock and ask it for help, or hold it down for gesture controls.
 
 - focus: blocks distracting apps and sites for a set time
 - queries: ask about anything on screen (local model)
@@ -14,4 +14,4 @@ pip install -r requirements.txt
 python main.py
 ```
 
-The model features need [Ollama](https://ollama.com) with `qwen3.8:27b` or another model with vision and tool use.
+Needs [Ollama](https://ollama.com) with `qwen3.8:27b` or another model with vision and tool use.
