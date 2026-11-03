@@ -1,6 +1,7 @@
 # Caps
 
-I built this to make my computer easier to use. Tap Caps Lock and type, or hold it and move the mouse.
+I built this to make my computer easier to use. 
+Tap Caps Lock and type, or hold it and move the mouse.
 
 - focus: blocks distracting apps and sites for a set time
 - queries: ask about anything on screen (local model)
